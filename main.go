@@ -3,15 +3,20 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
+	"unsafe"
+
+	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
 )
 
 const (
@@ -26,27 +31,18 @@ const (
 
 var (
 	bufPool  = sync.Pool{New: func() any { b := new(bytes.Buffer); b.Grow(preGrow); return b }}
-	mapPool  = sync.Pool{New: func() any { return make(map[string]json.RawMessage, 32) }}
 	copyPool = sync.Pool{New: func() any { return make([]byte, copyBufSize) }}
 
-	// 更“收紧”的 fast-path：匹配 `"instructions"` 后还要确认后面（可带空白）紧跟 `:`
-	kInstrKey = []byte(`"instructions"`)
+	gzipPool = sync.Pool{New: func() any { return (*gzip.Reader)(nil) }}
+
+	// fast-path keys (need to confirm ':' after optional whitespace)
+	kInstrKey       = []byte(`"instructions"`)
+	kPromptCacheKey = []byte(`"prompt_cache_key"`)
+	kPrevRespIDKey  = []byte(`"previous_response_id"`)
+
+	// sonic encoder: avoid trailing '\n'
+	sonicAPI = sonic.Config{NoEncoderNewline: true}.Froze()
 )
-
-func putBuf(b *bytes.Buffer) {
-	if b.Cap() > maxKeepBufCap {
-		return
-	}
-	b.Reset()
-	bufPool.Put(b)
-}
-
-func putMap(m map[string]json.RawMessage) {
-	for k := range m {
-		delete(m, k)
-	}
-	mapPool.Put(m)
-}
 
 type pooledBody struct {
 	r *bytes.Reader
@@ -55,6 +51,14 @@ type pooledBody struct {
 
 func (p *pooledBody) Read(x []byte) (int, error) { return p.r.Read(x) }
 func (p *pooledBody) Close() error               { putBuf(p.b); return nil }
+
+func putBuf(b *bytes.Buffer) {
+	if b.Cap() > maxKeepBufCap {
+		return
+	}
+	b.Reset()
+	bufPool.Put(b)
+}
 
 func setBody(req *http.Request, b *bytes.Buffer) {
 	bs := b.Bytes()
@@ -77,14 +81,14 @@ func (proxyBufPool) Put(p []byte) {
 
 func isWS(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
-// fast-path: 查找 `"instructions"` 并确认后面（可跳过空白）是 `:`
-func hasInstrKey(bs []byte) bool {
+// fast-path: find `"key"` and ensure next non-ws char is ':'
+func hasJSONKey(bs []byte, key []byte) bool {
 	for off := 0; ; {
-		idx := bytes.Index(bs[off:], kInstrKey)
+		idx := bytes.Index(bs[off:], key)
 		if idx < 0 {
 			return false
 		}
-		pos := off + idx + len(kInstrKey)
+		pos := off + idx + len(key)
 		for pos < len(bs) && isWS(bs[pos]) {
 			pos++
 		}
@@ -95,15 +99,91 @@ func hasInstrKey(bs []byte) bool {
 	}
 }
 
-// in[0]=='[' 前提下，判断是否是“只有空白的空数组”：[ ] / [\n\t ]
-func isEmptyJSONArrayWS(in []byte) bool {
-	for i := 1; i < len(in); i++ {
-		if isWS(in[i]) {
-			continue
-		}
-		return in[i] == ']'
+func bytesToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func isResponsesPath(p string) bool {
+	const suf = "/v1/responses"
+	if len(p) < len(suf) {
+		return false
 	}
-	return false
+	return p[len(p)-len(suf):] == suf
+}
+
+func getGzipReader(r io.Reader) (*gzip.Reader, error) {
+	if v := gzipPool.Get(); v != nil {
+		zr := v.(*gzip.Reader)
+		if zr != nil {
+			if err := zr.Reset(r); err == nil {
+				return zr, nil
+			}
+		}
+	}
+	return gzip.NewReader(r)
+}
+
+func putGzipReader(zr *gzip.Reader) {
+	_ = zr.Close()
+	gzipPool.Put(zr)
+}
+
+// Derive a stable prompt_cache_key without leaking the raw API key.
+// Priority: Authorization > x-api-key > api-key > (RemoteAddr + UA)
+func derivePromptCacheKey(req *http.Request) string {
+	var s string
+	if v := req.Header.Get("Authorization"); v != "" {
+		s = v
+	} else if v := req.Header.Get("x-api-key"); v != "" {
+		s = v
+	} else if v := req.Header.Get("api-key"); v != "" {
+		s = v
+	} else {
+		s = req.RemoteAddr + "|" + req.Header.Get("User-Agent")
+	}
+	sum := sha256.Sum256([]byte(s))
+	// 16 bytes -> 32 hex chars
+	return hex.EncodeToString(sum[:16])
+}
+
+// Pure byte insertion for prompt_cache_key at the start of a JSON object.
+// Requires: prompt_cache_key missing AND we don't need to rewrite instructions.
+func injectPromptCacheKeyFast(bs []byte, key string) (*bytes.Buffer, bool) {
+	// skip leading whitespace
+	i := 0
+	for i < len(bs) && isWS(bs[i]) {
+		i++
+	}
+	if i >= len(bs) || bs[i] != '{' {
+		return nil, false
+	}
+
+	out := bufPool.Get().(*bytes.Buffer)
+	out.Reset()
+	out.Grow(len(bs) + len(key) + 32)
+
+	// write up to and including '{'
+	out.Write(bs[:i+1])
+
+	// write `"prompt_cache_key":"<key>"`
+	out.WriteString(`"prompt_cache_key":"`)
+	out.WriteString(key)
+	out.WriteByte('"')
+
+	// detect empty object: next non-ws after '{' is '}'
+	j := i + 1
+	for j < len(bs) && isWS(bs[j]) {
+		j++
+	}
+	if j < len(bs) && bs[j] == '}' {
+		out.Write(bs[j:])
+		return out, true
+	}
+
+	// non-empty object
+	out.WriteByte(',')
+	out.Write(bs[i+1:])
+	return out, true
 }
 
 func main() {
@@ -116,29 +196,37 @@ func main() {
 	rp.BufferPool = proxyBufPool{}
 
 	rp.Transport = &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        4096,
-		MaxIdleConnsPerHost: 4096,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:   true,
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          4096,
+		MaxIdleConnsPerHost:   4096,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 
 	od := rp.Director
 	rp.Director = func(r *http.Request) {
 		od(r)
 		r.Host = tu.Host
-		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/v1/responses") {
-			tweak(r)
+
+		if r.Method == http.MethodPost && isResponsesPath(r.URL.Path) {
+			tweakBodySonic(r)
 		}
 	}
 
 	log.Printf("Proxy server starting on %s -> %s", LocalPort, TargetHost)
-	s := &http.Server{Addr: LocalPort, Handler: rp, ReadHeaderTimeout: 5 * time.Second}
+	s := &http.Server{
+		Addr:              LocalPort,
+		Handler:           rp,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Fatal(s.ListenAndServe())
 }
 
-func tweak(req *http.Request) {
+func tweakBodySonic(req *http.Request) {
 	if req.Body == nil {
 		return
 	}
@@ -146,15 +234,21 @@ func tweak(req *http.Request) {
 	b := bufPool.Get().(*bytes.Buffer)
 	b.Reset()
 
+	// pre-grow based on Content-Length if available
+	if req.ContentLength > 0 && req.ContentLength < maxKeepBufCap {
+		b.Grow(int(req.ContentLength))
+	}
+
+	// read body (support gzip)
 	if req.Header.Get("Content-Encoding") == "gzip" {
-		zr, err := gzip.NewReader(req.Body)
+		zr, err := getGzipReader(req.Body)
 		if err != nil {
 			req.Body.Close()
 			putBuf(b)
 			return
 		}
 		_, err = b.ReadFrom(zr)
-		zr.Close()
+		putGzipReader(zr)
 		req.Body.Close()
 		if err != nil {
 			putBuf(b)
@@ -171,95 +265,107 @@ func tweak(req *http.Request) {
 	}
 
 	bs := b.Bytes()
-	if !hasInstrKey(bs) {
+
+	needInstr := hasJSONKey(bs, kInstrKey)
+	hasPrompt := hasJSONKey(bs, kPromptCacheKey)
+	hasPrev := hasJSONKey(bs, kPrevRespIDKey)
+
+	// auto补 prompt_cache_key（缺失才补）
+	// instructions 迁移：当 previous_response_id 存在时不做（避免多轮重复注入膨胀）
+	shouldRewriteInstr := needInstr && !hasPrev
+
+	// Fast path: only need to inject prompt_cache_key; no instructions rewrite.
+	if !shouldRewriteInstr && !hasPrompt {
+		key := derivePromptCacheKey(req)
+		if out, ok := injectPromptCacheKeyFast(bs, key); ok {
+			putBuf(b)
+			setBody(req, out)
+			return
+		}
+		// fall through to AST if not a plain object
+	}
+
+	// If no changes needed at all, keep original body
+	if !shouldRewriteInstr && hasPrompt {
 		setBody(req, b)
 		return
 	}
 
-	m := mapPool.Get().(map[string]json.RawMessage)
-	if err := json.Unmarshal(bs, &m); err != nil {
-		putMap(m)
+	// AST path (sonic)
+	src := bytesToString(bs)
+	p := ast.NewParserObj(src)
+	root, perr := p.Parse()
+	if err := p.ExportError(perr); err != nil {
 		setBody(req, b)
 		return
 	}
 
-	ins, ok := m["instructions"]
-	if !ok || len(ins) <= 2 || ins[0] != '"' {
-		putMap(m)
-		setBody(req, b)
-		return
-	}
-	delete(m, "instructions")
-
-	in := m["input"]
-
-	// dev = {"role":"developer","content":<ins>}
-	dev := make([]byte, 0, 32+len(ins))
-	dev = append(dev, `{"role":"developer","content":`...)
-	dev = append(dev, ins...)
-	dev = append(dev, '}')
-
-	var newIn []byte
-	if len(in) == 0 || (len(in) == 4 && in[0] == 'n') { // missing or null
-		newIn = make([]byte, 0, len(dev)+2)
-		newIn = append(newIn, '[')
-		newIn = append(newIn, dev...)
-		newIn = append(newIn, ']')
-	} else {
-		switch in[0] {
-		case '"': // JSON string
-			um := make([]byte, 0, 24+len(in))
-			um = append(um, `{"role":"user","content":`...)
-			um = append(um, in...)
-			um = append(um, '}')
-
-			newIn = make([]byte, 0, len(dev)+len(um)+3)
-			newIn = append(newIn, '[')
-			newIn = append(newIn, dev...)
-			newIn = append(newIn, ',')
-			newIn = append(newIn, um...)
-			newIn = append(newIn, ']')
-
-		case '[': // JSON array（修复空白空数组）
-			if (len(in) == 2 && in[1] == ']') || isEmptyJSONArrayWS(in) {
-				newIn = make([]byte, 0, len(dev)+2)
-				newIn = append(newIn, '[')
-				newIn = append(newIn, dev...)
-				newIn = append(newIn, ']')
-			} else {
-				newIn = make([]byte, 0, len(dev)+len(in)+1)
-				newIn = append(newIn, '[')
-				newIn = append(newIn, dev...)
-				newIn = append(newIn, ',')
-				newIn = append(newIn, in[1:]...) // drop leading '['
-			}
-
-		default:
-			newIn = make([]byte, 0, len(dev)+2)
-			newIn = append(newIn, '[')
-			newIn = append(newIn, dev...)
-			newIn = append(newIn, ']')
+	// ensure prompt_cache_key
+	if !hasPrompt {
+		key := derivePromptCacheKey(req)
+		pk := root.Get("prompt_cache_key")
+		if pk == nil || !pk.Exists() || pk.TypeSafe() == ast.V_NULL {
+			_, _ = root.Set("prompt_cache_key", ast.NewString(key))
 		}
 	}
 
-	m["input"] = newIn
+	if shouldRewriteInstr {
+		ins := root.Get("instructions")
+		if ins != nil && ins.Exists() && ins.TypeSafe() == ast.V_STRING {
+			content := *ins
+			_, _ = root.Unset("instructions")
 
+			// dev = {"role":"developer","content":<ins>}
+			dev := ast.NewObject([]ast.Pair{
+				ast.NewPair("role", ast.NewString("developer")),
+				ast.NewPair("content", content),
+			})
+
+			in := root.Get("input")
+
+			// missing / null
+			if in == nil || !in.Exists() || in.TypeSafe() == ast.V_NULL {
+				_, _ = root.Set("input", ast.NewArray([]ast.Node{dev}))
+				goto ENCODE
+			}
+
+			switch in.TypeSafe() {
+			case ast.V_STRING:
+				user := ast.NewObject([]ast.Pair{
+					ast.NewPair("role", ast.NewString("user")),
+					ast.NewPair("content", *in),
+				})
+				_, _ = root.Set("input", ast.NewArray([]ast.Node{dev, user}))
+
+			case ast.V_ARRAY:
+				// in-place prepend: Add at end then Move to 0
+				if err := in.Add(dev); err == nil {
+					if n, err := in.Len(); err == nil && n > 1 {
+						_ = in.Move(0, n-1)
+					}
+				} else {
+					_, _ = root.Set("input", ast.NewArray([]ast.Node{dev}))
+				}
+
+			default:
+				_, _ = root.Set("input", ast.NewArray([]ast.Node{dev}))
+			}
+		}
+	}
+
+ENCODE:
 	out := bufPool.Get().(*bytes.Buffer)
 	out.Reset()
-	enc := json.NewEncoder(out)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(m); err != nil {
+	out.Grow(len(bs) + 64)
+
+	enc := sonicAPI.NewEncoder(out)
+	if err := enc.Encode(&root); err != nil {
 		putBuf(out)
-		putMap(m)
 		setBody(req, b)
 		return
 	}
-	if n := out.Len(); n > 0 && out.Bytes()[n-1] == '\n' {
-		out.Truncate(n - 1)
-	}
 
-	putMap(m)
+	// Only now safe to return b (AST may reference src backed by b)
 	putBuf(b)
-
 	setBody(req, out)
 }
