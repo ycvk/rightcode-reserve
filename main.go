@@ -6,10 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -189,11 +190,13 @@ func injectPromptCacheKeyFast(bs []byte, key string) (*bytes.Buffer, bool) {
 func main() {
 	tu, err := url.Parse(TargetHost)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("failed to parse target host", "error", err)
+		os.Exit(1)
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(tu)
 	rp.BufferPool = proxyBufPool{}
+	rp.FlushInterval = -1 // 立即刷新，SSE/流式响应必需
 
 	rp.Transport = &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -206,6 +209,16 @@ func main() {
 		ForceAttemptHTTP2:     true,
 	}
 
+	// 自定义错误处理：客户端主动断开是正常行为，不记录为错误
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if r.Context().Err() != nil {
+			// context canceled 或 deadline exceeded - 客户端已断开，静默处理
+			return
+		}
+		slog.Error("proxy error", "error", err)
+		w.WriteHeader(http.StatusBadGateway)
+	}
+
 	od := rp.Director
 	rp.Director = func(r *http.Request) {
 		od(r)
@@ -216,14 +229,17 @@ func main() {
 		}
 	}
 
-	log.Printf("Proxy server starting on %s -> %s", LocalPort, TargetHost)
+	slog.Info("proxy server starting", "local", LocalPort, "target", TargetHost)
 	s := &http.Server{
 		Addr:              LocalPort,
 		Handler:           rp,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	log.Fatal(s.ListenAndServe())
+	if err := s.ListenAndServe(); err != nil {
+		slog.Error("server error", "error", err)
+		os.Exit(1)
+	}
 }
 
 func tweakBodySonic(req *http.Request) {
@@ -265,6 +281,16 @@ func tweakBodySonic(req *http.Request) {
 	}
 
 	bs := b.Bytes()
+
+	// 记录请求的 model 和 reasoning_effort（使用 sonic.Get 快速提取，不完整解析）
+	if model, _ := sonic.Get(bs, "model"); model.Valid() {
+		modelStr, _ := model.String()
+		effort := "-"
+		if re, _ := sonic.Get(bs, "reasoning", "effort"); re.Valid() {
+			effort, _ = re.String()
+		}
+		slog.Info("request", "model", modelStr, "reasoning_effort", effort)
+	}
 
 	needInstr := hasJSONKey(bs, kInstrKey)
 	hasPrompt := hasJSONKey(bs, kPromptCacheKey)
