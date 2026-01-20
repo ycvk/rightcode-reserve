@@ -282,14 +282,15 @@ func tweakBodySonic(req *http.Request) {
 
 	bs := b.Bytes()
 
-	// 记录请求的 model 和 reasoning_effort（使用 sonic.Get 快速提取，不完整解析）
+	// 打印 model 和 reasoning.effort
 	if model, _ := sonic.Get(bs, "model"); model.Valid() {
 		modelStr, _ := model.String()
-		effort := "-"
 		if re, _ := sonic.Get(bs, "reasoning", "effort"); re.Valid() {
-			effort, _ = re.String()
+			effort, _ := re.String()
+			slog.Info("request info", "model", modelStr, "reasoning.effort", effort)
+		} else {
+			slog.Info("request info", "model", modelStr)
 		}
-		slog.Info("request", "model", modelStr, "reasoning_effort", effort)
 	}
 
 	needInstr := hasJSONKey(bs, kInstrKey)
@@ -319,9 +320,13 @@ func tweakBodySonic(req *http.Request) {
 
 	// AST path (sonic)
 	src := bytesToString(bs)
+
 	p := ast.NewParserObj(src)
 	root, perr := p.Parse()
-	if err := p.ExportError(perr); err != nil {
+
+	// perr == 0 表示成功
+	if perr != 0 {
+		slog.Error("ast parse error", "perr", perr)
 		setBody(req, b)
 		return
 	}
@@ -386,6 +391,7 @@ ENCODE:
 
 	enc := sonicAPI.NewEncoder(out)
 	if err := enc.Encode(&root); err != nil {
+		slog.Error("ast encode error", "error", err)
 		putBuf(out)
 		setBody(req, b)
 		return
